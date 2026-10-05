@@ -1,0 +1,17 @@
+# Optional Blueprint for a server-only repository with these files at its root.
+# Manual public-repository deployment uses the equivalent settings in DEPLOYMENT.md.
+# Keep the workspace free and without a payment method; usage limits still apply.
+services:
+  - type: web
+    name: pong-breaker-rendezvous
+    runtime: python
+    plan: free
+    autoDeployTrigger: "off"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python rendezvous.py --host 0.0.0.0 --max-per-ip 128
+    healthCheckPath: /healthz
+    envVars:
+      - key: ALLOW_GAMEPLAY_RELAY
+        value: "1"
+      - key: STUN_URL
+        value: stun:stun.l.google.com:19302

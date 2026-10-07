@@ -1,1 +1,6 @@
-
+; Minimal server-only project. It imports no client scenes or cosmetic resources.
+config_version=5
+[application]
+config/name="Pong-Breaker Replay Verifier"
+[rendering]
+renderer/rendering_method="gl_compatibility"

@@ -4,8 +4,10 @@ This native WebSocket service introduces peers and coordinates their lobby.
 WebRTC is the first gameplay transport. If it cannot connect, the paired lobby
 can switch to bounded opaque gameplay packets over the same WebSocket service.
 The host remains authoritative; the broker never interprets native game packets
-or simulates ball, paddle, or score state. Optional TURN is an independent ICE
-configuration, not a prerequisite for the WebSocket fallback.
+or simulates live ball, paddle, or score state. Completed eligible matches are
+independently replayed by the server-owned Godot verifier before rewards are
+awarded; this does not change live peer transport. Optional TURN is an independent
+ICE configuration, not a prerequisite for the WebSocket fallback.
 
 Default endpoint: `ws://127.0.0.1:8765/signal`. `/` is also accepted. Native clients
 must omit the HTTP Origin header. Browser clients require an explicit allowed
@@ -166,5 +168,4 @@ at 16 KiB; oversize frames close with code 1009. No error returns submitted SDP,
 ICE contents, secrets, or other players' private room state.
 # Release 1.4 extension
 
-The original signaling protocol below remains compatible. Authenticated accounts, shops, mode-separated queues, replay verification and receipts are specified in [PROGRESSION.md](PROGRESSION.md). Feature-detect `welcome.progression_version` and capabilities before sending credentials or requests. A host's `round_complete` message never awards coins or rating.
-
+The original signaling protocol above remains compatible. Authenticated accounts, shops, mode-separated queues, replay verification and receipts are specified in [PROGRESSION.md](PROGRESSION.md). Feature-detect `welcome.progression_version` and capabilities before sending credentials or requests. A host's `round_complete` message never awards coins or rating.

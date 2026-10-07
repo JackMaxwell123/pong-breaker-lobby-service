@@ -3,7 +3,7 @@
 # Keep the workspace free and without a payment method; usage limits still apply.
 services:
   - type: web
-    name: pong-breaker-rendezvous
+    name: pong-breaker-live
     runtime: docker
     plan: free
     autoDeployTrigger: "off"

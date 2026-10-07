@@ -170,3 +170,7 @@ For WebRTC, the game displays peer connection state without claiming to have
 verified whether ICE selected direct or TURN traffic; the WSS fallback is
 identified separately. Internet routes and a real TURN allocation remain
 deployment tests, separate from passing PC loopback runs.
+# Release 1.4 progression deployment note
+
+The release now includes durable player accounts, an independent Godot replay verifier, and optional verified commerce. Follow [PROGRESSION.md](PROGRESSION.md) for the current Docker build, complete server package, PostgreSQL configuration, environment gates, refund policy and no-cost staging sequence. The native-Python commands and single-file service description below document the earlier guest matchmaking deployment. They remain useful for understanding the existing live service, but they are not sufficient to enable the new economy. No production database or payment/ad credential is included, and this local release work did not deploy them.
+

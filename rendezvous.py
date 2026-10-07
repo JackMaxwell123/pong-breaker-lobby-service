@@ -21,8 +21,13 @@ import unicodedata
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from economy import Economy, EconomyError
+from progression import Progression
+from replay_verifier import GodotReplayVerifier
+
 
 PROTOCOL = "PONG_BREAKER_WEBRTC_1"
+GAME_PROTOCOL = "PONG_BREAKER_1_4"
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,48}\Z")
 MAX_MESSAGE = 16384
@@ -129,6 +134,10 @@ class Client:
     violations: int = 0
     seen_ids: set[str] = field(default_factory=set)
     recent_ids: deque[str] = field(default_factory=deque)
+    account_id: str | None = None
+    profile: dict = field(default_factory=dict)
+    queue_mode: str = "casual"
+    game_protocol: str = ""
 
 
 @dataclass
@@ -143,11 +152,13 @@ class Room:
     offer_sent: bool = False
     answer_sent: bool = False
     relay_enabled: bool = False
+    mode: str = "casual"
+    matchmade: bool = False
 
 
 class Rendezvous:
     def __init__(self, *, limits: Limits | None = None, ice: IceConfig | None = None,
-                 allow_gameplay_relay: bool = True):
+                 allow_gameplay_relay: bool = True, economy=None, verifier=None, stores=None, receipt_cipher=None):
         self.limits = limits or Limits()
         self.ice = ice or IceConfig()
         self.allow_gameplay_relay = allow_gameplay_relay
@@ -159,15 +170,22 @@ class Rendezvous:
         self._sweep: asyncio.Task | None = None
         self._closers: set[asyncio.Task] = set()
         self._closing = False
+        self.progression = Progression(self, economy, verifier, stores, receipt_cipher)
 
     async def start(self, host: str = "127.0.0.1", port: int = 8765,
                     allowed_origins: tuple[str, ...] = ()) -> Server:
         if self._server is not None or self._closing:
             raise RuntimeError("Service already started or closed")
 
-        def route(connection, request):
+        async def route(connection, request):
             if request.path == "/healthz":
                 return connection.respond(HTTPStatus.OK, "Pong-Breaker rendezvous ready\n")
+            if request.path.startswith("/rewards/admob?"):
+                try:
+                    await self.progression.ad_callback(request.path.split("?", 1)[1])
+                    return connection.respond(HTTPStatus.OK, "Verified\n")
+                except Exception:
+                    return connection.respond(HTTPStatus.BAD_REQUEST, "Unverified reward\n")
             if request.path not in ("/", "/signal"):
                 return connection.respond(HTTPStatus.NOT_FOUND, "Unknown endpoint\n")
             return None
@@ -194,6 +212,7 @@ class Rendezvous:
             self._server = None
         if self._closers:
             await asyncio.gather(*tuple(self._closers), return_exceptions=True)
+        await self.progression.close()
 
     def _close_later(self, client: Client, code: int, reason: str) -> None:
         if client.closing:
@@ -300,7 +319,7 @@ class Rendezvous:
             if kind in {"list_rooms", "create_room", "join_room", "quick_match", "ice_config"} and not client.actions.take(now):
                 raise RequestError("rate_limited", "Too many lobby operations")
             self._dispatch(client, kind, message, now)
-        except RequestError as error:
+        except (RequestError, EconomyError) as error:
             self._error(client, error.code, error.message, request_id)
             if error.code in {"bad_message", "bad_protocol", "hello_required", "already_hello", "duplicate_request", "rate_limited"}:
                 client.violations += 1
@@ -347,6 +366,7 @@ class Rendezvous:
             self._emit(client, {"type": "welcome", "protocol": PROTOCOL, "client_id": client.id,
                                "heartbeat_seconds": 20, **self.ice.for_client(client.id),
                                "gameplay_relay": self.allow_gameplay_relay,
+                               "progression_version": 1, "capabilities": self.progression.capabilities(),
                                "limits": {"message_bytes": MAX_MESSAGE, "name_characters": 16,
                                           "queue_seconds": self.limits.queue_seconds,
                                           "relay_packet_bytes": MAX_RELAY_PACKET,
@@ -355,6 +375,8 @@ class Rendezvous:
             return
         if not client.hello:
             raise RequestError("hello_required", "Send hello before lobby commands")
+        if self.progression.dispatch(client, kind, msg):
+            return
         if kind == "ping":
             self._fields(msg, set())
             self._emit(client, {"type": "pong", "request_id": msg["request_id"]})
@@ -392,14 +414,29 @@ class Rendezvous:
             self._ack(client, msg)
             self._broadcast_room(room)
         elif kind == "quick_match":
-            self._fields(msg, set())
+            self._fields(msg, {"mode", "game_protocol"})
             self._require_idle(client)
+            mode = msg.get("mode", "casual")
+            game_protocol = msg.get("game_protocol", "")
+            if not isinstance(game_protocol, str) or (game_protocol and re.fullmatch(r"[A-Z0-9_]{1,48}", game_protocol) is None):
+                raise RequestError("bad_message", "Invalid gameplay protocol")
+            if mode not in ("ranked", "casual"):
+                raise RequestError("bad_message", "Match mode must be ranked or casual")
+            if mode == "ranked":
+                self.progression.require_account(client)
+                if not self.progression.capabilities()["ranked"]:
+                    raise RequestError("ranked_unavailable", "Ranked play is waiting for durable storage and independent replay verification")
+                if game_protocol != GAME_PROTOCOL:
+                    raise RequestError("game_update_required", "Update Pong-Breaker before entering ranked play")
+            client.queue_mode = mode
+            client.game_protocol = game_protocol
             candidate = next((self.clients.get(identity) for identity in self.waiting
                               if identity in self.clients and not self.clients[identity].closing
                               and self.clients[identity].queued_at is not None
-                              and now - self.clients[identity].queued_at < self.limits.queue_seconds), None)
+                              and now - self.clients[identity].queued_at < self.limits.queue_seconds
+                              and self._compatible(client, self.clients[identity], now)), None)
             if candidate is not None:
-                room = self._create([candidate, client], False, now)
+                room = self._create([candidate, client], False, now, mode=mode, matchmade=True)
                 self._remove_from_queue(candidate)
                 self._ack(client, msg)
                 self._emit(candidate, {"type": "queue", "queued": False, "reason": "matched"})
@@ -409,7 +446,7 @@ class Rendezvous:
                 client.queued_at = now
                 self.waiting.append(client.id)
                 self._ack(client, msg)
-                self._emit(client, {"type": "queue", "queued": True})
+                self._emit(client, {"type": "queue", "queued": True, "mode": mode})
         elif kind == "cancel_queue":
             self._fields(msg, set())
             self._remove_from_queue(client)
@@ -437,8 +474,7 @@ class Rendezvous:
                 for identity in room.players:
                     self.clients[identity].ready = False
                 self._broadcast_room(room)
-                self._broadcast(room, {"type": "start", "session_id": room.session_id,
-                                       "round_id": room.round_id, "seed": seed})
+                self.progression.round_start(room, seed)
             else:
                 self._broadcast_room(room)
         elif kind == "round_complete":
@@ -566,13 +602,24 @@ class Rendezvous:
         self._ack(client, msg)
         self._emit(opponent, event)
 
-    def _create(self, players: list[Client], public: bool, now: float) -> Room:
+    def _compatible(self, first: Client, second: Client, now: float) -> bool:
+        if first.queue_mode != second.queue_mode or first.game_protocol != second.game_protocol or (first.account_id and first.account_id == second.account_id):
+            return False
+        if first.queue_mode != "ranked":
+            return True
+        first_rating = first.profile.get("ranked", {}).get("rating", 1000)
+        second_rating = second.profile.get("ranked", {}).get("rating", 1000)
+        waited = max(now - (first.queued_at or now), now - (second.queued_at or now))
+        return abs(first_rating - second_rating) <= min(600, 150 + int(waited / 15) * 75)
+
+    def _create(self, players: list[Client], public: bool, now: float, *, mode="casual", matchmade=False) -> Room:
         if len(self.rooms) >= self.limits.rooms:
             raise RequestError("capacity", "Room capacity reached; try again later")
         code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
         while code in self.rooms:
             code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
         room = Room(code, public, [client.id for client in players], secrets.token_hex(16), now)
+        room.mode, room.matchmade = mode, matchmade
         self.rooms[code] = room
         for client in players:
             client.room, client.ready = code, False
@@ -582,8 +629,12 @@ class Rendezvous:
         return {"code": room.code, "public": room.public, "session_id": room.session_id,
                 "phase": room.phase, "round_id": room.round_id, "host_id": room.players[0],
                 "relay_enabled": room.relay_enabled,
+                "mode": room.mode, "matchmade": room.matchmade,
                 "players": [{"client_id": identity, "peer_id": number + 1,
-                             "name": self.clients[identity].name, "ready": self.clients[identity].ready}
+                             "name": self.clients[identity].name, "ready": self.clients[identity].ready,
+                             "cosmetics": self.clients[identity].profile.get("equipped", {}),
+                             "equipped": self.clients[identity].profile.get("equipped", {}),
+                             "ranked": self.clients[identity].profile.get("ranked", {})}
                             for number, identity in enumerate(room.players)]}
 
     def _broadcast(self, room: Room, event: dict) -> None:
@@ -622,6 +673,19 @@ class Rendezvous:
             for room in tuple(self.rooms.values()):
                 if room.phase == "lobby" and now - room.created >= self.limits.lobby_seconds:
                     self._dissolve(room.code, "lobby_expired")
+            # A widening skill window can match two already waiting players.
+            queued = [self.clients[identity] for identity in self.waiting if identity in self.clients and not self.clients[identity].closing]
+            for index, first in enumerate(queued):
+                if first.queued_at is None:
+                    continue
+                second = next((other for other in queued[index+1:] if other.queued_at is not None and self._compatible(first, other, now)), None)
+                if second and len(self.rooms) < self.limits.rooms:
+                    room = self._create([first, second], False, now, mode=first.queue_mode, matchmade=True)
+                    for client in (first, second):
+                        self._remove_from_queue(client)
+                        self._emit(client, {"type": "queue", "queued": False, "reason": "matched"})
+                    self._broadcast_room(room)
+        await self.progression.sweep(now)
 
     async def _maintenance(self) -> None:
         while True:
@@ -634,8 +698,17 @@ async def run(args) -> None:
     relay_setting = os.environ.get("ALLOW_GAMEPLAY_RELAY", "1").lower()
     if relay_setting not in {"0", "1", "false", "true"}:
         raise ValueError("ALLOW_GAMEPLAY_RELAY must be 0/1 or false/true")
+    economy = Economy.from_environment()
+    verifier = GodotReplayVerifier.from_environment()
+    try:
+        from store_verification import StoreVerifier, ReceiptCipher
+        stores = StoreVerifier.from_environment()
+        receipt_cipher = ReceiptCipher.from_environment()
+    except ImportError:
+        stores = None
+        receipt_cipher = None
     broker = Rendezvous(limits=Limits(per_ip=args.max_per_ip), ice=config,
-                        allow_gameplay_relay=relay_setting in {"1", "true"})
+                        allow_gameplay_relay=relay_setting in {"1", "true"}, economy=economy, verifier=verifier, stores=stores, receipt_cipher=receipt_cipher)
     await broker.start(args.host, args.port, tuple(args.allowed_origin))
     print(json.dumps({"event": "listening", "host": args.host, "port": args.port,
                       "protocol": PROTOCOL, "gameplay_relay": broker.allow_gameplay_relay,
@@ -644,6 +717,8 @@ async def run(args) -> None:
         await asyncio.Event().wait()
     finally:
         await broker.close()
+        if economy:
+            economy.close()
 
 
 def main() -> None:

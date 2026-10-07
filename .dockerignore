@@ -1,4 +1,14 @@
 *
 !rendezvous.py
+!economy.py
+!progression.py
+!replay_verifier.py
+!store_verification.py
+!install_verifier.py
 !requirements.txt
+!requirements-progression.txt
+!verifier/
+!verifier/project.godot
+!verifier/replay.gd
+!verifier/simulation.gd
 !Dockerfile

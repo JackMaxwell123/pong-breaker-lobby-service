@@ -4,14 +4,21 @@
 services:
   - type: web
     name: pong-breaker-rendezvous
-    runtime: python
+    runtime: docker
     plan: free
     autoDeployTrigger: "off"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python rendezvous.py --host 0.0.0.0 --max-per-ip 128
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /healthz
     envVars:
       - key: ALLOW_GAMEPLAY_RELAY
         value: "1"
       - key: STUN_URL
         value: stun:stun.l.google.com:19302
+      - key: PB_GODOT_BINARY
+        value: /opt/pong-verifier/godot
+      - key: PB_REPLAY_SIMULATION
+        value: /app/verifier/simulation.gd
+      # Set PB_DATABASE_URL and attest PB_DURABLE_STORAGE=1 only after provisioning
+      # a genuinely persistent external PostgreSQL database and tested backups.
+      # No database, ad or purchase credential is committed in this Blueprint.

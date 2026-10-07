@@ -164,3 +164,7 @@ Errors: `error {code,message,request_id}`. Codes include `bad_message`,
 violations can close a connection with policy code 1008. Message size is capped
 at 16 KiB; oversize frames close with code 1009. No error returns submitted SDP,
 ICE contents, secrets, or other players' private room state.
+# Release 1.4 extension
+
+The original signaling protocol below remains compatible. Authenticated accounts, shops, mode-separated queues, replay verification and receipts are specified in [PROGRESSION.md](PROGRESSION.md). Feature-detect `welcome.progression_version` and capabilities before sending credentials or requests. A host's `round_complete` message never awards coins or rating.
+

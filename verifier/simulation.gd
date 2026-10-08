@@ -16,6 +16,7 @@ const PADDLE_HEIGHT: float = 10.0
 const BALL_RADIUS: float = 5.0
 const BRICK_ORIGIN: Vector2 = Vector2(39, 263)
 const MAX_BALLS: int = 6
+const MATCH_SECONDS: float = 900.0
 const POWER_KINDS: Array = ["WIDE", "SHIELD", "MULTIBALL", "OVERDRIVE", "STICKY"]
 const EPS: float = 0.00001
 
@@ -38,6 +39,9 @@ var _accumulator: float = 0.0
 var _next_ball_id: int = 1
 var _next_drop_id: int = 1
 var _seed_value: int = 1
+var _tick_goals: Array = []
+var _in_tick: bool = false
+var _resolving_goals: bool = false
 var _rng: RandomNumberGenerator = RandomNumberGenerator.new()
 
 
@@ -132,6 +136,8 @@ func _tick(targets: Array) -> void:
 			ball["hold_timer"] = maxf(0.0, float(ball["hold_timer"]) - FIXED_DT)
 			if float(ball["hold_timer"]) <= EPS:
 				_release_ball(ball)
+	_tick_goals.clear()
+	_in_tick = true
 	var remove_ids: Array = []
 	for ball_value in balls:
 		var ball: Dictionary = ball_value
@@ -150,6 +156,8 @@ func _tick(targets: Array) -> void:
 			remove_ids.append(ball["id"])
 		if phase == "finished":
 			break
+	_in_tick = false
+	_resolve_tick_goals(remove_ids)
 	for index in range(balls.size() - 1, -1, -1):
 		if balls[index]["id"] in remove_ids:
 			balls.remove_at(index)
@@ -157,6 +165,13 @@ func _tick(targets: Array) -> void:
 		return
 	_move_drops()
 	_tick_feeders()
+	if tick >= int(MATCH_SECONDS / FIXED_DT):
+		# A long match ends on lives, then brick score; an exact tie is a draw.
+		var advantage: int = int(players[0].hp) - int(players[1].hp)
+		if advantage == 0: advantage = int(players[0].score) - int(players[1].score)
+		winner = 0 if advantage > 0 else 1 if advantage < 0 else -1
+		phase = "finished"
+		events.append({"type":"game_over", "winner":winner})
 	serveTimer = 0.0
 	for ball_value in balls:
 		var delay: float = float(ball_value["serve"])
@@ -383,7 +398,7 @@ func _sync_ball_power(ball: Dictionary) -> void:
 	var powered: bool = float(players[int(ball["owner"])]["overdrive"]) > 0.0
 	ball["overdrive"] = powered
 	ball["damage"] = 2 if powered else 1
-	var speed: float = 350.0 if powered else clampf(float(ball["speed"]), 180.0, 400.0)
+	var speed: float = maxf(350.0, float(ball["speed"])) if powered else clampf(float(ball["speed"]), 180.0, 400.0)
 	var velocity: Vector2 = ball["vel"]
 	if velocity.length_squared() > EPS:
 		ball["vel"] = velocity.normalized() * speed
@@ -459,6 +474,9 @@ func _move_ball(ball: Dictionary, duration: float) -> bool:
 		var normal: Vector2 = best["normal"]
 		match String(best["kind"]):
 			"goal":
+				if _in_tick:
+					_tick_goals.append({"ball":ball, "defender":int(best["index"]), "time":duration - remaining})
+					return false
 				return _goal(ball, int(best["index"]))
 			"shield":
 				var defender: int = int(best["index"])
@@ -771,6 +789,28 @@ func _hit_brick(ball: Dictionary, index: int) -> void:
 			events.append({"type": "drop_spawned", "id": drop["id"], "owner": owner, "kind": kind, "pos": pos})
 
 
+func _resolve_tick_goals(remove_ids: Array) -> void:
+	# Resolve goal crossings by their swept time, never by entity insertion order.
+	# Crossings within 10 microseconds are simultaneous; two fatal goals draw.
+	_tick_goals.sort_custom(func(a, b): return float(a.time) < float(b.time))
+	_resolving_goals = true
+	var first: int = 0
+	while first < _tick_goals.size() and phase == "playing":
+		var end: int = first + 1
+		while end < _tick_goals.size() and float(_tick_goals[end].time) - float(_tick_goals[first].time) <= EPS:
+			end += 1
+		for index in range(first, end):
+			var goal: Dictionary = _tick_goals[index]
+			if _goal(goal.ball, int(goal.defender)): remove_ids.append(goal.ball.id)
+		if int(players[0].hp) == 0 or int(players[1].hp) == 0:
+			winner = -1 if int(players[0].hp) == int(players[1].hp) else 0 if int(players[1].hp) == 0 else 1
+			phase = "finished"
+			events.append({"type":"game_over", "winner":winner})
+		first = end
+	_resolving_goals = false
+	_tick_goals.clear()
+
+
 func _goal(ball: Dictionary, defender: int) -> bool:
 	var player: Dictionary = players[defender]
 	player["hp"] = maxi(0, int(player["hp"]) - 1)
@@ -779,13 +819,13 @@ func _goal(ball: Dictionary, defender: int) -> bool:
 		players[attacker]["score"] = int(players[attacker]["score"]) + 100
 	events.append({"type": "goal", "player": defender, "defender": defender, "owner": attacker,
 		"ball": ball["id"], "hp": player["hp"], "pos": ball["pos"]})
-	if int(player["hp"]) <= 0:
+	if int(player["hp"]) <= 0 and not _resolving_goals:
 		phase = "finished"
 		winner = 1 - defender
 		events.append({"type": "game_over", "winner": winner})
 		return false
 	if bool(ball["base"]):
-		_prepare_serve(ball, defender, 0.75)
+		if int(player["hp"]) > 0: _prepare_serve(ball, defender, 0.75)
 		return false
 	return true
 
@@ -810,6 +850,10 @@ func _move_drops() -> void:
 
 func _grant_powerup(player_index: int, kind: String) -> void:
 	var player: Dictionary = players[player_index]
+	var capped: bool = (kind == "SHIELD" and int(player.shield) >= 3) or (kind == "MULTIBALL" and balls.size() >= MAX_BALLS)
+	if capped:
+		events.append({"type":"powerup_capped", "player":player_index, "owner":player_index, "kind":kind, "pos":Vector2(float(player.x), float(PADDLE_Y[player_index]))})
+		return
 	match kind:
 		"WIDE":
 			player["wide"] = 12.0
@@ -922,8 +966,11 @@ static func valid_snapshot(state: Dictionary) -> bool:
 	if state.phase == "playing":
 		if state.winner != -1 or state.players[0].hp == 0 or state.players[1].hp == 0:
 			return false
-	elif state.winner < 0 or state.players[1 - state.winner].hp != 0 or state.players[state.winner].hp <= 0:
-		return false
+	elif float(state.elapsed) < MATCH_SECONDS - 0.01:
+		if state.winner == -1:
+			if state.players[0].hp != 0 or state.players[1].hp != 0: return false
+		elif state.players[1 - state.winner].hp != 0 or state.players[state.winner].hp <= 0:
+			return false
 	if not state.balls is Array or state.balls.size() < 2 or state.balls.size() > MAX_BALLS:
 		return false
 	var ball_ids: Dictionary = {}
@@ -1130,7 +1177,7 @@ static func _snapshot_event(event: Dictionary, state: Dictionary) -> bool:
 		"serve": ["ball", "owner", "pos"], "paddle_hit": ["ball", "owner", "pos"],
 		"wall_hit": ["ball", "pos"], "brick_hit": ["brick", "owner", "pos", "hp"],
 		"brick_destroyed": ["brick", "owner", "pos"], "drop_spawned": ["id", "owner", "kind", "pos"],
-		"powerup": ["player", "owner", "kind", "pos"], "goal": ["player", "defender", "owner", "ball", "hp", "pos"],
+		"powerup_capped": ["player", "owner", "kind", "pos"], "powerup": ["player", "owner", "kind", "pos"], "goal": ["player", "defender", "owner", "ball", "hp", "pos"],
 		"shield_block": ["player", "ball", "pos"], "sticky_catch": ["ball", "owner", "pos"],
 		"sticky_release": ["ball", "owner", "pos"], "brick_spawned": ["brick", "side", "pos"],
 		"brick_arrived": ["brick", "side", "pos"], "game_over": ["winner"]}
@@ -1140,7 +1187,7 @@ static func _snapshot_event(event: Dictionary, state: Dictionary) -> bool:
 		if not event.has(key):
 			return false
 	for key in ["owner", "player", "defender", "winner"]:
-		if event.has(key) and not _snapshot_int(event[key], 0, 1):
+		if event.has(key) and not _snapshot_int(event[key], -1 if key == "winner" else 0, 1):
 			return false
 	if event.has("pos") and not _snapshot_vector(event.pos, -36.0, 396.0, TOP_GOAL - 1, BOTTOM_GOAL + 1):
 		return false

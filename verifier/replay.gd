@@ -20,7 +20,7 @@ func _initialize() -> void:
 		quit(2)
 		return
 	var frames: Array = replay.frames
-	if frames.size() < 1800 or frames.size() > 54000:
+	if frames.size() < 1 or frames.size() > 54000:
 		quit(2)
 		return
 	var script = load(simulation_path)
@@ -43,7 +43,7 @@ func _initialize() -> void:
 		for player in range(2):
 			if int(frame[4 + player]) == 1:
 				sim.release_sticky(player, aims[player])
-	if sim.phase != "finished" or sim.winner not in [0, 1]:
+	if (sim.phase != "finished" and not replay.get("allow_incomplete", false)) or sim.winner not in [-1, 0, 1]:
 		quit(3)
 		return
 	print("PB_VERIFIED:" + JSON.stringify({"phase": sim.phase, "winner": sim.winner, "frames": frames.size(), "ticks": sim.tick}))

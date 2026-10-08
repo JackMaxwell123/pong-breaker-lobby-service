@@ -4,6 +4,12 @@
 !progression.py
 !replay_verifier.py
 !store_verification.py
+!public_resources.py
+!public/
+!public/privacy.html
+!public/account.html
+!public/support.css
+!public/account.js
 !install_verifier.py
 !requirements.txt
 !requirements-progression.txt

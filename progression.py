@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from economy import CATALOG, EconomyError, REWARD_COINS, operation_id
 from replay_verifier import ReplayUpload, MAX_FRAMES, CHUNK_FRAMES
 
-COMMANDS = {"account_auth", "account_delete", "profile_get", "catalog_get", "shop_buy", "cosmetic_equip", "reward_prepare", "reward_claim", "reward_status", "purchase_submit", "replay_chunk", "replay_seal", "match_receipt_get"}
+COMMANDS = {"account_auth", "account_rotate", "account_delete", "match_presence", "match_concede", "profile_get", "catalog_get", "shop_buy", "cosmetic_equip", "reward_prepare", "reward_claim", "reward_status", "purchase_submit", "replay_chunk", "replay_seal", "match_receipt_get"}
 
 
 class Progression:
@@ -29,6 +29,7 @@ class Progression:
         self._commerce_check_at = 0.0
         self._commerce_check_running = False
         self._pending_expiry_at = 0.0
+        self.started_at = time.time()
 
     def capabilities(self):
         durable = bool(self.economy and self.economy.durable)
@@ -118,6 +119,30 @@ class Progression:
             await self._profile(client, msg, "account", **({"token": token} if token else {}), catalog=CATALOG)
             return
         self.require_account(client)
+        if kind in ("match_presence", "match_concede", "replay_chunk", "replay_seal", "match_receipt_get") and msg.get("match_id") not in self.uploads:
+            match = await self._db(self.economy.match, msg.get("match_id"))
+            players = (match["player0"], match["player1"])
+            if client.account_id not in players:
+                raise EconomyError("wrong_match", "This account is not a player in this match")
+            if match["state"] != "pending":
+                await self._notify_receipt(players, json.loads(match["receipt"]), client=client, request_id=msg["request_id"])
+                return
+            if match["created"] < self.started_at:
+                receipt = await self._db(self.economy.reject_match, match["id"], "service_restarted")
+                await self._notify_receipt(players, receipt)
+                return
+        if kind == "account_rotate":
+            fields(msg, {"new_token", "operation_id"})
+            self.broker._require_idle(client)
+            result = await self._db(self.economy.rotate_key, client.account_id, msg.get("new_token"), msg.get("operation_id"))
+            for other in list(self.broker.clients.values()):
+                if other is not client and other.account_id == client.account_id:
+                    other.account_id, other.profile = None, {}
+                    self.broker._remove_from_queue(other)
+                    self.broker._dissolve(other.room, "recovery_code_changed")
+                    self.broker._close_later(other, 4001, "Recovery code changed; sign in again")
+            await self._profile(client, msg, "account_rotated", result=result)
+            return
         if kind == "account_delete":
             fields(msg, {"confirmation", "operation_id"})
             self.broker._require_idle(client)
@@ -180,10 +205,20 @@ class Progression:
                     # A retry uses Google's token uniqueness and safely finalizes the same grant.
                     finalized = False
             await self._profile(client, msg, "purchase", result={**result, "finalized": finalized})
+        elif kind in ("match_presence", "match_concede"):
+            fields(msg, {"match_id"})
+            upload = self._upload(msg.get("match_id"), client.account_id)
+            index = upload.players.index(client.account_id)
+            upload.presence_at[index] = time.monotonic()
+            if kind == "match_concede" and not upload.verifying:
+                upload.conceded = index
+            self.broker._emit(client, {"type":"match_presence_ack", "request_id":msg["request_id"]})
         elif kind == "replay_chunk":
             fields(msg, {"match_id", "offset", "frames"})
             upload = self._upload(msg.get("match_id"), client.account_id)
             offset = upload.append(client.account_id, msg.get("offset"), msg.get("frames"))
+            index = upload.players.index(client.account_id)
+            upload.last_frame_at[index] = upload.presence_at[index] = time.monotonic()
             self.broker._emit(client, {"type": "replay_ack", "match_id": msg["match_id"], "offset": offset, "request_id": msg["request_id"]})
         elif kind == "replay_seal":
             fields(msg, {"match_id", "sha256", "frames"})
@@ -230,7 +265,7 @@ class Progression:
         clients = [self.broker.clients.get(identity) for identity in room.players]
         players = tuple(client.account_id if client else None for client in clients)
         eligible = eligible and len(set(players)) == 2 and all(players)
-        eligible = eligible and all(client and client.game_protocol == "PONG_BREAKER_1_4" for client in clients)
+        eligible = eligible and all(client and client.game_protocol == "PONG_BREAKER_1_5" for client in clients)
         if room.mode == "ranked" and not eligible:
             self.broker._dissolve(room.code, "ranked_temporarily_unavailable")
             return
@@ -238,7 +273,7 @@ class Progression:
             self.pending_jobs += 1
             try:
                 await self._db(self.economy.create_match, match_id, players, room.mode, seed)
-                self.uploads[match_id] = ReplayUpload(players, seed, time.monotonic())
+                self.uploads[match_id] = ReplayUpload(players, seed, time.monotonic(), mode=room.mode)
             except Exception:
                 if room.mode == "ranked":
                     self.broker._dissolve(room.code, "progression_unavailable")
@@ -250,6 +285,7 @@ class Progression:
             return
         self.broker._broadcast(room, {"type": "start", "session_id": room.session_id, "round_id": match_id,
                                      "match_id": match_id, "seed": seed, "mode": room.mode, "reward_eligible": bool(eligible),
+                                     "host_color": getattr(clients[0], "color_preference", -1) if getattr(clients[0], "color_preference", -1) in (0,1) and getattr(clients[1], "color_preference", -1) == 1 - clients[0].color_preference else __import__("secrets").randbelow(2),
                                      "replay": {"version": 1, "fps": 60, "max_frames": MAX_FRAMES, "chunk_frames": CHUNK_FRAMES,
                                                 "simulation_sha256": self.verifier.simulation_hash if self.verifier else ""}})
 
@@ -275,8 +311,60 @@ class Progression:
             event.update(coins=receipt["awards"][index], rating_delta=receipt["rating_deltas"][index])
             await self._profile(target, {"request_id": request_id}, "match_receipt", **event)
 
+    async def _adjudicate(self, match_id, upload, loser):
+        # Never trust an opponent's claim of absence. sweep uses only the service's
+        # authenticated receipt times, and this independently verifies their shared prefix.
+        count = min(len(upload.frames[0]), len(upload.frames[1]))
+        try:
+            if count < 1 or upload.frames[0][:count] != upload.frames[1][:count]:
+                raise EconomyError("interrupted_unconfirmed", "No agreed gameplay was available")
+            frames = upload.frames[0][:count]
+            result = await self.verifier.verify(upload.seed, frames, allow_incomplete=True)
+            finished = result["phase"] == "finished"
+            digest = hashlib.sha256(b"".join(__import__("replay_verifier").canonical_frame(f) for f in frames)).hexdigest()
+            receipt = await self._db(self.economy.settle_verified, match_id,
+                                    winner=result["winner"] if finished else 1-loser,
+                                    frames=count, replay_hash=digest, forfeit=not finished)
+        except EconomyError as error:
+            receipt = await self._db(self.economy.reject_match, match_id, error.code)
+        except Exception:
+            receipt = await self._db(self.economy.reject_match, match_id, "verification_unavailable")
+        self.uploads.pop(match_id, None)
+        await self._notify_receipt(upload.players, receipt)
+
     async def sweep(self, now):
         for match_id, upload in tuple(self.uploads.items()):
+            if upload.verifying: continue
+            # Uploaded, matching complete evidence cannot be vetoed by withholding
+            # a final seal. A verifier still has to find the real terminal state.
+            if any(upload.seals) and len(upload.frames[0]) == len(upload.frames[1]) and upload.hashes[0].hexdigest() == upload.hashes[1].hexdigest():
+                upload.seals = [upload.hashes[0].hexdigest()] * 2
+                upload.verifying = True
+                self._task(self._verify(match_id, upload))
+                continue
+            if upload.mode == "ranked" and now - upload.created > 5:
+                presence = [now - (stamp or upload.created) for stamp in upload.presence_at]
+                progress = [now - (stamp or upload.created) for stamp in upload.last_frame_at]
+                loser = upload.conceded
+                if loser is None and max(presence) > 30 and min(presence) <= 10:
+                    loser = 0 if presence[0] > presence[1] else 1
+                if loser is None and max(progress) > 30 and max(presence) <= 10:
+                    # Two connected players with divergent/missing peer delivery
+                    # cannot safely accuse each other. A host may have withheld
+                    # input frames from an honest guest while uploading its own.
+                    receipt = await self._db(self.economy.reject_match, match_id, "gameplay_interrupted")
+                    self.uploads.pop(match_id, None)
+                    await self._notify_receipt(upload.players, receipt)
+                    continue
+                if loser is not None and presence[1-loser] <= 10:
+                    upload.verifying = True
+                    self._task(self._adjudicate(match_id, upload, loser))
+                    continue
+                if min(presence) > 35:
+                    receipt = await self._db(self.economy.reject_match, match_id, "both_disconnected")
+                    self.uploads.pop(match_id, None)
+                    await self._notify_receipt(upload.players, receipt)
+                    continue
             if not upload.verifying and now - upload.created > 1200:
                 receipt = await self._db(self.economy.reject_match, match_id, "replay_expired")
                 self.uploads.pop(match_id, None)

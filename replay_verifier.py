@@ -14,7 +14,7 @@ from economy import EconomyError
 
 MAX_FRAMES = 54000  # Fifteen minutes at the canonical 60 Hz caller cadence.
 CHUNK_FRAMES = 120
-MIN_FRAMES = 1800
+MIN_FRAMES = 1
 
 
 def canonical_frame(frame):
@@ -34,19 +34,30 @@ class ReplayUpload:
     hashes: list = field(default_factory=lambda: [hashlib.sha256(), hashlib.sha256()])
     seals: list[str | None] = field(default_factory=lambda: [None, None])
     verifying: bool = False
+    last_frame_at: list[float] = field(default_factory=lambda: [0.0, 0.0])
+    presence_at: list[float] = field(default_factory=lambda: [0.0, 0.0])
+    mode: str = "casual"
+    conceded: int | None = None
 
     def append(self, account_id, offset, frames):
         if account_id not in self.players:
             raise EconomyError("wrong_match", "This account is not a player in this match")
         index = self.players.index(account_id)
-        if self.seals[index] or self.verifying:
-            raise EconomyError("replay_sealed", "This replay has already been sealed")
-        if type(offset) is not int or offset != len(self.frames[index]):
-            raise EconomyError("replay_offset", "Replay chunks must arrive in order without gaps or overlap")
+        if type(offset) is not int or offset < 0:
+            raise EconomyError("replay_offset", "Replay chunks must arrive in order")
         if not isinstance(frames, list) or not 1 <= len(frames) <= CHUNK_FRAMES or offset + len(frames) > MAX_FRAMES:
             raise EconomyError("replay_size", "Replay chunk or match exceeds its frame limit")
         # Validate the entire chunk before mutating the hash or accumulated frames.
         encoded = [canonical_frame(frame) for frame in frames]
+        # Acknowledgments can be lost during a signaling reconnect. Only an exact,
+        # wholly contained retry is idempotent; partial overlaps remain invalid.
+        end = offset + len(frames)
+        if end <= len(self.frames[index]) and self.frames[index][offset:end] == frames:
+            return len(self.frames[index])
+        if self.seals[index] or self.verifying:
+            raise EconomyError("replay_sealed", "This replay has already been sealed")
+        if offset != len(self.frames[index]):
+            raise EconomyError("replay_offset", "Replay chunks must arrive in order without gaps or changed overlap")
         for line in encoded:
             self.hashes[index].update(line)
         self.frames[index].extend(frames)
@@ -91,7 +102,7 @@ class GodotReplayVerifier:
         simulation = os.environ.get("PB_REPLAY_SIMULATION", str(packaged if packaged.exists() else Path(__file__).resolve().parents[1] / "scripts" / "simulation.gd"))
         return cls(executable, simulation)
 
-    async def verify(self, seed, frames):
+    async def verify(self, seed, frames, *, allow_incomplete=False):
         if hashlib.sha256(self.simulation.read_bytes()).hexdigest() != self.simulation_hash:
             raise EconomyError("verifier_changed", "Simulation source changed; restart the verifier before awarding matches")
         if not MIN_FRAMES <= len(frames) <= MAX_FRAMES:
@@ -99,7 +110,7 @@ class GodotReplayVerifier:
         async with self._slots:
             with tempfile.TemporaryDirectory(prefix="pong-verified-replay-") as directory:
                 path = Path(directory) / "replay.json"
-                path.write_text(json.dumps({"version": 1, "seed": seed, "frames": frames}, separators=(",", ":")), encoding="utf-8")
+                path.write_text(json.dumps({"version": 1, "seed": seed, "frames": frames, "allow_incomplete": allow_incomplete}, separators=(",", ":")), encoding="utf-8")
                 process = await asyncio.create_subprocess_exec(
                     str(self.executable), "--headless", "--path", str(self.project), "--script", "res://replay.gd", "--",
                     "--replay", str(path), "--simulation", str(self.simulation),
@@ -118,6 +129,6 @@ class GodotReplayVerifier:
                     result = json.loads(records[-1]) if len(records) == 1 else None
                 except ValueError:
                     result = None
-                if not isinstance(result, dict) or result.get("winner") not in (0, 1) or result.get("frames") != len(frames) or result.get("phase") != "finished":
+                if not isinstance(result, dict) or result.get("winner") not in (-1, 0, 1) or result.get("frames") != len(frames) or result.get("phase") not in (("playing", "finished") if allow_incomplete else ("finished",)):
                     raise EconomyError("replay_incomplete", "The recorded inputs did not produce a completed match")
                 return result

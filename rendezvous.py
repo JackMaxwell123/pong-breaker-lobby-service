@@ -24,10 +24,11 @@ from websockets.exceptions import ConnectionClosed
 from economy import Economy, EconomyError
 from progression import Progression
 from replay_verifier import GodotReplayVerifier
+from public_resources import response as public_response
 
 
 PROTOCOL = "PONG_BREAKER_WEBRTC_1"
-GAME_PROTOCOL = "PONG_BREAKER_1_4"
+GAME_PROTOCOL = "PONG_BREAKER_1_5"
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,48}\Z")
 MAX_MESSAGE = 16384
@@ -138,6 +139,7 @@ class Client:
     profile: dict = field(default_factory=dict)
     queue_mode: str = "casual"
     game_protocol: str = ""
+    color_preference: int = -1
 
 
 @dataclass
@@ -178,6 +180,9 @@ class Rendezvous:
             raise RuntimeError("Service already started or closed")
 
         async def route(connection, request):
+            public = public_response(connection, request.path)
+            if public is not None:
+                return public
             if request.path == "/healthz":
                 return connection.respond(HTTPStatus.OK, "Pong-Breaker rendezvous ready\n")
             if request.path.startswith("/rewards/admob?"):
@@ -380,6 +385,14 @@ class Rendezvous:
         if kind == "ping":
             self._fields(msg, set())
             self._emit(client, {"type": "pong", "request_id": msg["request_id"]})
+        elif kind == "color_preference":
+            self._fields(msg, {"value"})
+            if type(msg.get("value")) is not int or msg["value"] not in (-1, 0, 1):
+                raise RequestError("bad_message", "Choose red, blue or either")
+            if client.room and self.rooms[client.room].phase == "playing":
+                raise RequestError("match_active", "Change color preference between matches")
+            client.color_preference = msg["value"]
+            self._ack(client, msg)
         elif kind == "ice_config":
             self._fields(msg, set())
             self._emit(client, {"type": "ice_config", **self.ice.for_client(client.id), "request_id": msg["request_id"]})
@@ -709,7 +722,12 @@ async def run(args) -> None:
         receipt_cipher = None
     broker = Rendezvous(limits=Limits(per_ip=args.max_per_ip), ice=config,
                         allow_gameplay_relay=relay_setting in {"1", "true"}, economy=economy, verifier=verifier, stores=stores, receipt_cipher=receipt_cipher)
-    await broker.start(args.host, args.port, tuple(args.allowed_origin))
+    origins = list(args.allowed_origin)
+    # Only the provider's configured service hostname becomes an implicit origin.
+    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
+    if re.fullmatch(r"[a-z0-9-]+\.onrender\.com", hostname):
+        origins.append("https://" + hostname)
+    await broker.start(args.host, args.port, tuple(origins))
     print(json.dumps({"event": "listening", "host": args.host, "port": args.port,
                       "protocol": PROTOCOL, "gameplay_relay": broker.allow_gameplay_relay,
                       "turn_configured": bool(config.turn_urls)}), flush=True)

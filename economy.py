@@ -189,6 +189,21 @@ class Economy:
     def _ledger(self, account_id, amount, reason):
         self._sql("INSERT INTO pb_ledger(id,account_id,delta,reason,created) VALUES(?,?,?,?,?)", (secrets.token_hex(16), account_id, amount, reason, int(self.now())))
 
+    def rotate_key(self, account_id, new_token, op):
+        """Client durably saves the proposed key before sending; a lost reply is recoverable."""
+        operation_id(op)
+        if not isinstance(new_token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", new_token):
+            raise EconomyError("invalid_token", "A replacement recovery code must have 256 bits of random data")
+        digest = hashlib.sha256(new_token.encode()).hexdigest()
+        with self.transaction():
+            row = self._account(account_id, lock=True)
+            if row['token_hash'] == digest:
+                return {"rotated": True}
+            if self._sql("SELECT id FROM pb_accounts WHERE token_hash=?", (digest,)).fetchone():
+                raise EconomyError("invalid_token", "This replacement code is already in use")
+            self._sql("UPDATE pb_accounts SET token_hash=? WHERE id=?", (digest, account_id))
+        return {"rotated": True}
+
     def profile(self, account_id):
         with self._lock:
             a = self._account(account_id)
@@ -406,13 +421,9 @@ class Economy:
                 raise EconomyError("unknown_match", "This match is not eligible for rewards")
             return dict(row)
 
-    def repeated_opponents(self, players):
-        row = self._sql("SELECT COUNT(*) AS count FROM pb_matches WHERE state='verified' AND created>? AND ((player0=? AND player1=?) OR (player0=? AND player1=?))", (int(self.now())-3600, *players, *reversed(players))).fetchone()
-        return row["count"] >= 3
-
-    def settle_verified(self, match_id, *, winner, frames, replay_hash):
+    def settle_verified(self, match_id, *, winner, frames, replay_hash, forfeit=False):
         """Internal verifier boundary. Network dispatch NEVER accepts these values."""
-        if type(winner) is not int or winner not in (0, 1) or not 1800 <= frames <= 54000:
+        if type(winner) is not int or winner not in (-1, 0, 1) or type(frames) is not int or not 1 <= frames <= 54000 or (forfeit and winner == -1):
             raise EconomyError("invalid_result", "The verifier result is outside the rewarded match rules")
         with self.transaction():
             match = self.match(match_id)
@@ -424,22 +435,24 @@ class Economy:
             if self.now() - match["created"] + 5 < frames / 60:
                 raise EconomyError("invalid_duration", "The replay ran faster than real time")
             players = [match["player0"], match["player1"]]
-            repeated = self.repeated_opponents(players)
-            awards = [0, 0] if repeated else ([40, 40] if match["mode"] == "ranked" else [20, 20])
-            if not repeated:
+            awards = [40, 40] if match["mode"] == "ranked" else [20, 20]
+            if winner >= 0:
                 awards[winner] += 20 if match["mode"] == "ranked" else 10
+            if forfeit:
+                awards = [0, 0]
+                if frames >= 600: awards[winner] = 40 if match["mode"] == "ranked" else 20
             deltas = [0, 0]
-            if match["mode"] == "ranked" and not repeated:
+            if match["mode"] == "ranked":
                 expected = 1 / (1 + 10 ** (max(-1600, min(1600, accounts[players[1]]["rating"] - accounts[players[0]]["rating"])) / 400))
                 k = 32 if min(accounts[p]["ranked_games"] for p in players) < 10 else 24
-                change = round(k * ((1 if winner == 0 else 0) - expected))
+                change = round(k * ((0.5 if winner == -1 else 1 if winner == 0 else 0) - expected))
                 change = max(-accounts[players[0]]["rating"], min(accounts[players[1]]["rating"], change))
                 deltas = [change, -change]
             for index, player in enumerate(players):
-                self._sql("UPDATE pb_accounts SET coins=coins+?,rating=rating+?,ranked_games=ranked_games+?,wins=wins+? WHERE id=?", (awards[index], deltas[index], int(match["mode"] == "ranked" and not repeated), int(match["mode"] == "ranked" and not repeated and index == winner), player))
+                self._sql("UPDATE pb_accounts SET coins=coins+?,rating=rating+?,ranked_games=ranked_games+?,wins=wins+? WHERE id=?", (awards[index], deltas[index], int(match["mode"] == "ranked"), int(match["mode"] == "ranked" and index == winner), player))
                 self._ledger(player, awards[index], "match:" + match_id)
             receipt = {"match_id": match_id, "status": "verified", "winner": winner, "awards": awards, "rating_deltas": deltas,
-                       "frames": frames, "replay_hash": replay_hash, "reason": "repeat_opponent_practice" if repeated else "completed"}
+                       "frames": frames, "replay_hash": replay_hash, "reason": "forfeit" if forfeit else "draw" if winner == -1 else "completed"}
             self._sql("UPDATE pb_matches SET state='verified',receipt=? WHERE id=?", (encode(receipt), match_id))
             return receipt
 

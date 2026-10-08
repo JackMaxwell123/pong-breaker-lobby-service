@@ -3,8 +3,9 @@
 This native WebSocket service introduces peers and coordinates their lobby.
 WebRTC is the first gameplay transport. If it cannot connect, the paired lobby
 can switch to bounded opaque gameplay packets over the same WebSocket service.
-The host remains authoritative; the broker never interprets native game packets
-or simulates live ball, paddle, or score state. Completed eligible matches are
+The host sequences gameplay inputs; release 1.5 stock guests independently
+simulate that witnessed stream. The broker routes native game packets without
+simulating live ball, paddle, or score state. Completed eligible matches are
 independently replayed by the server-owned Godot verifier before rewards are
 awarded; this does not change live peer transport. Optional TURN is an independent
 ICE configuration, not a prerequisite for the WebSocket fallback.
@@ -55,7 +56,7 @@ queueing while in another activity is rejected: leave/cancel first. Cancelling
 an absent queue or leaving an absent room is harmless. Public listings expose
 only public rooms with one player waiting in a lobby. Private rooms are unlisted,
 not authenticated: knowledge of their random invitation code grants admission.
-There are no accounts, passwords, chat, or hidden reconnection tokens.
+Guest-only mode has no accounts or chat. The authenticated progression extension is described below.
 
 Room snapshots are sent to both members after a membership/readiness change:
 
@@ -154,7 +155,7 @@ Any leave, dead socket, signaling failure cleanup, or server shutdown dissolves
 the room for everyone: `room_closed {code,session_id,reason}`. No host migration,
 resume, automatic requeue, or automatic native transport retry occurs. Remaining
 clients may explicitly create/join/queue again. A reconnect gets a new identity.
-Close the native peer when the signaling room closes. Clients send `ping` every
+Legacy guest clients close the native peer when the room closes. Release 1.5 eligible direct matches may keep their native peer while reconnecting and restoring their upload; they return to matchmaking afterward. Relay matches cannot continue without their service. Clients send `ping` every
 20 seconds; application silence for 90 seconds and missing WebSocket pong
 responses disconnect dead peers. Waiting lobbies expire after 15 minutes.
 
@@ -166,6 +167,6 @@ Errors: `error {code,message,request_id}`. Codes include `bad_message`,
 violations can close a connection with policy code 1008. Message size is capped
 at 16 KiB; oversize frames close with code 1009. No error returns submitted SDP,
 ICE contents, secrets, or other players' private room state.
-# Release 1.4 extension
+# Release 1.5 extension
 
 The original signaling protocol above remains compatible. Authenticated accounts, shops, mode-separated queues, replay verification and receipts are specified in [PROGRESSION.md](PROGRESSION.md). Feature-detect `welcome.progression_version` and capabilities before sending credentials or requests. A host's `round_complete` message never awards coins or rating.

@@ -6,6 +6,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY requirements-progression.txt ./
 RUN pip install --no-cache-dir -r requirements-progression.txt
 COPY rendezvous.py economy.py progression.py replay_verifier.py store_verification.py ./
+COPY public_resources.py ./
+COPY public ./public
 COPY verifier ./verifier
 COPY install_verifier.py ./
 RUN python install_verifier.py --destination /opt/pong-verifier

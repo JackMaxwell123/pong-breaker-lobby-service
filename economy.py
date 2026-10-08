@@ -34,7 +34,7 @@ for _slot, _names in NAMES.items():
     CATALOG.extend({"id": f"{_slot}_{i+1}", "slot": _slot, "name": name, "price": PRICES[_slot][i]} for i, name in enumerate(_names))
 CATALOG.extend({"id": "theme_" + key, "slot": "theme", "name": name, "price": 1200} for key, name in (
     ("conservatory", "Midnight Conservatory"), ("observatory", "Tidal Observatory"),
-    ("cloudline", "Cloudline Express"), ("arcade", "Celestial Arcade")))
+    ("cloudline", "Cloudline Express"), ("arcade", "Celestial Arcade"), ("rally", "Rally Club")))
 ITEMS = {item["id"]: item for item in CATALOG}
 FREE_ITEMS = [item["id"] for item in CATALOG if item["price"] == 0]
 

@@ -24,7 +24,10 @@ el('check').addEventListener('click', () => {
       deadline = setTimeout(() => failure('For privacy, this page signed out after five minutes. Nothing was deleted.'), 300000);
     }
     if (message.type === 'account_deleted') { stop(); say('Your online profile has been deleted. Its recovery code no longer works.'); }
-    if (message.type === 'error') { const deleted = message.code === 'account_deleted'; failure(deleted ? 'This profile has already been deleted. Its recovery code no longer works.' : String(message.message || 'The request could not be completed.').slice(0,200)); }
+    if (message.type === 'error') {
+      const help = {account_deleted:'This profile has already been deleted. Its recovery code no longer works.', invalid_token:'That recovery code was not recognized. Copy the current code from Profile → Recovery & Privacy in the game, then try again. Nothing was deleted.'};
+      failure(help[message.code] || String(message.message || 'The request could not be completed.').slice(0,200));
+    }
   };
 });
 el('confirmation').addEventListener('input', () => { el('remove').disabled = !authenticated || deleting || el('confirmation').value !== 'DELETE'; });

@@ -14,7 +14,7 @@ The database stores hashed, 256-bit bearer player keys. The original key is retu
 
 ## Account, shop and reward messages
 
-Every request retains the existing unique `request_id` envelope. Mutation `operation_id` is a second stable retry key, 8–80 ASCII letters/digits/underscore/hyphen. Reuse it for retries of the SAME operation on a new request/connection. Changing its payload fails. Currency and ownership changes share one transaction. Rebuying an owned cosmetic never debits twice. Free classic styles and ball_1/paddle_1/brick_1 are owned from creation, alongside 150 welcome coins.
+Every request retains the existing unique `request_id` envelope. Mutation `operation_id` is a second stable retry key, 8–80 ASCII letters/digits/underscore/hyphen. Reuse it for retries of the SAME operation on a new request/connection. Changing its payload fails. Currency and ownership changes share one transaction. Rebuying an owned cosmetic never debits twice. Only the four Classic styles are owned and equipped at creation, alongside 150 welcome coins. Rally Pearl costs 200 coins, Rally Pro 300, and Prism Ceramic 350. Existing ownership is retained.
 
 | Request | Fields | Response |
 |---|---|---|

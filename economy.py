@@ -28,7 +28,7 @@ NAMES = {
     "paddle": ["Rally Pro", "Rose Parade", "Pocket Ocean", "Dragon's Rest", "Starliner", "Sugar Sprint", "Brassbound", "Moonbridge"],
     "brick": ["Prism Ceramic", "Mini Conservatory", "Mixtape", "Dragon Hoard", "Mooncake", "Geode"],
 }
-PRICES = {"ball": [0, 200, 200, 400, 400, 400, 600, 600], "paddle": [0, 300, 300, 500, 500, 500, 800, 800], "brick": [0, 350, 350, 600, 600, 600]}
+PRICES = {"ball": [200, 200, 200, 400, 400, 400, 600, 600], "paddle": [300, 300, 300, 500, 500, 500, 800, 800], "brick": [350, 350, 350, 600, 600, 600]}
 CATALOG = [{"id": slot + "_classic", "slot": slot, "name": "Classic", "price": 0} for slot in ("ball", "paddle", "brick", "theme")]
 for _slot, _names in NAMES.items():
     CATALOG.extend({"id": f"{_slot}_{i+1}", "slot": _slot, "name": name, "price": PRICES[_slot][i]} for i, name in enumerate(_names))
@@ -177,7 +177,7 @@ class Economy:
         token = secrets.token_urlsafe(32)
         account_id = secrets.token_hex(16)
         now = int(self.now())
-        equipped = {"ball": "ball_1", "paddle": "paddle_1", "brick": "brick_1", "theme": "theme_classic"}
+        equipped = {slot: slot + "_classic" for slot in ("ball", "paddle", "brick", "theme")}
         with self.transaction():
             self._sql("INSERT INTO pb_accounts(id,token_hash,created,coins,rating,ranked_games,wins,equipped) VALUES(?,?,?,?,?,?,?,?)",
                       (account_id, hashlib.sha256(token.encode()).hexdigest(), now, WELCOME_COINS, 1000, 0, 0, encode(equipped)))
